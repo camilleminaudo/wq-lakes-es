@@ -1,8 +1,10 @@
 # =============================================================================
 # 01_build_wq_database.R
 #
-# Builds ONE harmonised water-quality database from two sources:
+# Builds ONE harmonised water-quality database from three sources:
 #   ACA  : Catalan reservoirs & lakes, 2007–2026 (long format, one row = one value)
+#   CHE  : Confederación Hidrográfica del Ebro, lakes & reservoirs of the Ebro basin,
+#          2016–2026 (long format, https://datossuperficiales.chebro.es)
 #   M100 : Margalef et al. "100 embalses" survey, 1970s (wide format, µeq/L & µmol/L)
 #
 # Outputs (in out_dir):
@@ -12,7 +14,8 @@
 #   lake_summary_priority.csv        one row = one lake, priority variables side by side
 #   variable_dictionary.csv          harmonised variable names, units, original names
 #   unit_conversions.csv             every (variable, original unit) -> factor applied
-#   cross_source_check.csv           lakes present in both sources: medians compared
+#   cross_source_check.csv           lakes present in several sources: medians compared
+#   cross_source_close_sites.csv     sites of different sources < 1 km apart (same lake?)
 #   coordinates_manual.csv           fill in missing / wrong coordinates (and fix names)
 #   coordinates_close_pairs.csv      different lakes with (almost) the same coordinates
 #   lake_attributes_manual.csv       fill in max depth / area from other sources (optional)
@@ -30,6 +33,8 @@ base_dir <- "C:/Users/Camille Minaudo/OneDrive - Universitat de Barcelona/Docume
 aca_file        <- file.path(base_dir, "ACA/WQ_embassaments_estanys_2007-2026.csv")
 m100_file       <- file.path(base_dir, "100embass/DAT_100embass_extract_des13_cerca llac.csv")       # <- adjust
 m100_names_file <- file.path(base_dir, "100embass/DAT_100embass_extract_des13_cerca llac_NOMS.csv")  # <- adjust
+
+che_file        <- file.path(base_dir, "CHE/WCASF_20261023115457.csv")   # <- adjust (NULL = skip CHE)
 
 out_dir <- file.path(base_dir, "ES_lakes_WQ_database")
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
@@ -69,6 +74,11 @@ m100_layers <- c("E", "M")
 aca_max_depth_m <- 5
 # ACA: keep only years >= this (NULL = all years)
 aca_min_year <- NULL
+# CHE: point samples kept down to this depth (m). Photic-zone integrated samples
+# ("Integrada Capa Fótica ...") are always kept: their depth is the layer thickness.
+che_max_depth_m <- 5
+# CHE sample types left out of the water-quality statistics (whole water column, bottom)
+che_types_excluded <- c("Integrada Perfil Vertical", "Puntual Cercana al Fondo")
 
 # Coordinates ----
 # Coordinates are reused from previous runs, in this order:
@@ -81,23 +91,28 @@ aca_min_year <- NULL
 coords_manual_file <- file.path(out_dir, "coordinates_manual.csv")   # <- or the path of your own file
 geocode_missing <- TRUE      # look up remaining sites in OpenStreetMap (needs tidygeocoder + internet)
 aca_utm_crs     <- 25831     # CRS of ACA X/Y columns if any (ETRS89 / UTM 31N)
+che_utm_crs     <- 25830     # CRS of CHE ETRS89_X30 / ETRS89_Y30 (ETRS89 / UTM 30N)
 bcn             <- c(lat = 41.3874, lon = 2.1686)
 
 # Lake depth & area ----
 # Max depth = deepest sample in either database (a lower bound of the true max depth),
 # unless given in lake_attributes_manual.csv.
 min_n_depths_profile <- 3     # a lake counts as "profiled" if sampled at >= this many depths
+max_plausible_depth_m <- 200  # sampling depths above this are treated as errors (set to NA and listed)
 # Area = OpenStreetMap water polygon containing (or nearest to) the lake point
-get_osm_area     <- TRUE      # needs packages osmdata + sf, and internet
-osm_snap_m       <- 300       # point outside any water polygon: take the nearest one within this distance
+get_osm_area     <- F      # needs packages osmdata + sf, and internet
+osm_snap_m       <- 100       # point outside any water polygon: take the nearest one within this distance
 small_lake_ha    <- 1         # lakes smaller than this are flagged
-close_coords_m   <- 500       # different lakes closer than this are flagged (duplicated coordinates?)
+close_coords_m   <- 500       # different lakes of the same source closer than this are flagged
+same_lake_m      <- 1000      # sites of different sources closer than this: listed as "same lake?"
 
 # Lakes present in both sources whose names don't match automatically.
 # site_uid -> lake_key of the other source (lake_key = simplified name, see sites.csv)
+# See cross_source_close_sites.csv for candidates found by distance.
 lake_crosswalk <- tribble(
   ~site_uid,   ~lake_key
   # "M100_79", "darnius boadella"
+  # "CHE_E4679", "utxesa"
 )
 
 # Variables to prioritise (order used in tables & figures)
@@ -105,7 +120,7 @@ priority_vars <- c("Alk", "TP", "TN", "PO4", "NO3", "NH4", "SO4",
                    "Ca", "Mg", "Cond", "pH", "CHLa", "Secchi")
 
 # Preferred source when a lake has data in both (first = preferred)
-source_priority <- c("ACA", "M100")
+source_priority <- c("ACA", "CHE", "M100")
 
 
 # ---- Reference tables ---------------------------------------------------------
@@ -125,19 +140,20 @@ var_description <- c(Alk = "Alkalinity", TP = "Total phosphorus", TN = "Total ni
                      Cond = "Conductivity", pH = "pH", CHLa = "Chlorophyll-a",
                      Secchi = "Secchi depth", Temp = "Water temperature")
 
-# Plausible ranges after conversion: values outside are reported (unit problems)
+# Plausible ranges after conversion: values outside are reported (unit problems).
+# Upper limits allow for the saline lakes of the Ebro basin (Chiprana, Gallocanta, Añana...)
 plausible <- tribble(
   ~var,    ~lo,   ~hi,
-  "Alk",    0,     20,
+  "Alk",    0,     100,
   "TP",     0,     5,
   "TN",     0,     50,
   "PO4",    0,     10,
   "NO3",    0,     200,
   "NH4",    0,     20,
-  "SO4",    0,     3000,
-  "Ca",     0,     800,
-  "Mg",     0,     500,
-  "Cond",   1,     20000,
+  "SO4",    0,     100000,
+  "Ca",     0,     3000,
+  "Mg",     0,     25000,
+  "Cond",   1,     250000,
   "pH",     3,     11,
   "CHLa",   0,     1000,
   "Secchi", 0,     40
@@ -172,6 +188,14 @@ m100_meta_cols <- c("IdMEU", "Any", "CodiEmbass", "Campanya", "Grup", "GrupSIMP"
                     "Grup2", "CAPA", "Fond m", "Fondval")
 site_level_vars <- c("Secchi")   # one value per visit, repeated on every depth row in M100
 
+# CHE parameter codes ("Cód. parámetro") -> harmonised names (others kept under their name)
+che_var_map <- c(
+  "ALCALI" = "Alk", "P_TOT" = "TP", "N_T" = "TN", "PO4" = "PO4", "NO3" = "NO3",
+  "SO4" = "SO4", "CA" = "Ca", "MG" = "Mg", "COND20" = "Cond", "pH" = "pH",
+  "CLOROFA" = "CHLa", "SECCHI" = "Secchi", "TEM_AG" = "Temp"
+  # not mapped on purpose: PH_ZF, COND_ZF, COND_SUP, COND_FON... (summaries of the profiles)
+)
+
 
 # ---- Helpers ------------------------------------------------------------------
 
@@ -179,6 +203,7 @@ site_level_vars <- c("Secchi")   # one value per visit, repeated on every depth 
 lake_key_from_name <- function(x) {
   x %>%
     str_to_lower() %>%
+    str_remove("\\s*\\((orilla|fq)\\)\\s*$") %>%          # CHE near-shore points = same lake
     stringi::stri_trans_general("Latin-ASCII") %>%
     str_replace_all("[^a-z0-9 ]", " ") %>%
     str_squish() %>%
@@ -208,19 +233,19 @@ unit_factor <- function(var, unit) {
     return(1)
   }
   if (is.na(unit) || unit %in% c("", "-")) return(NA_real_)
-
+  
   p     <- unit_parts(unit)
   mass  <- unname(c(mg = 1, ug = 1e-3, ng = 1e-6, g = 1e3)[p$scale])
   molar <- unname(c(mmol = 1, umol = 1e-3)[p$scale])
   equiv <- unname(c(meq = 1, ueq = 1e-3)[p$scale])
   tag   <- p$tag
-
+  
   out <- switch(var,
                 Alk = {
                   if (!is.na(equiv)) equiv
                   else if (!is.na(molar)) molar                           # mmol HCO3 = meq
                   else if (!is.na(mass)) {
-                    as <- if (tag == "caco3") "CaCO3" else if (tag == "hco3") "HCO3" else alk_mg_as
+                    as <- if (tag %in% c("caco3", "co3ca")) "CaCO3" else if (tag == "hco3") "HCO3" else alk_mg_as
                     mass / (molar_mass[[as]] / charge[[as]])
                   } else NA
                 },
@@ -352,6 +377,30 @@ read_user_csv <- function(f) {
 }
 parse_coord <- function(x) as.numeric(str_replace(str_squish(x), ",", "."))
 
+# Numbers with a decimal comma or point ("36,5" or "36.5").
+# NB: readr::parse_number() reads "36,5" as 365 (comma = thousands separator), so it is not
+# used for depths and coordinates.
+parse_dec <- function(x, na = c("", "-", "--", "NA", "NR")) {
+  x <- str_squish(as.character(x))
+  x[x %in% na] <- NA
+  x <- str_remove(x, "^[<>]\\s*")
+  x <- str_replace(x, "^(-?\\d*),(\\d+)$", "\\1.\\2")
+  suppressWarnings(as.numeric(x))
+}
+
+# Sampling depths above max_plausible_depth_m are set to NA and reported
+check_depths <- function(df, src) {
+  bad <- !is.na(df$depth_m) & (df$depth_m > max_plausible_depth_m | df$depth_m < 0)
+  if (any(bad)) {
+    warning(sum(bad), " ", src, " rows with an impossible sampling depth (> ",
+            max_plausible_depth_m, " m or < 0) set to NA — see the list printed above")
+    cat("\n", src, ": impossible sampling depths (set to NA):\n", sep = "")
+    print(df[bad, ] %>% count(site_code, site_name, depth_m, name = "n_rows"), n = 30)
+    df$depth_m[bad] <- NA
+  }
+  df
+}
+
 find_col <- function(df, pattern) {
   hit <- names(df)[str_detect(str_to_lower(names(df)), pattern)]
   if (length(hit) == 0) NA_character_ else hit[1]
@@ -365,11 +414,12 @@ find_col <- function(df, pattern) {
 aca_enc <- coalesce(readr::guess_encoding(aca_file)$encoding[1], "UTF-8")
 aca_raw <- read_csv(aca_file, col_types = cols(.default = col_character()),
                     locale = locale(encoding = aca_enc), na = c("", "NA"))
-names(aca_raw) <- names(aca_raw) %>%
+clean_names <- function(x) x %>%
   stringi::stri_trans_general("Latin-ASCII") %>%
   str_to_lower() %>%
   str_replace_all("[^a-z0-9]+", ".") %>%
   str_remove_all("^\\.|\\.$")
+names(aca_raw) <- clean_names(names(aca_raw))
 cat("ACA file read with encoding", aca_enc, "—", nrow(aca_raw), "rows\n")
 glimpse(aca_raw)
 
@@ -403,9 +453,7 @@ aca <- aca_raw %>%
     var_original = str_squish(.data[[aca_cols[["variable"]]]]),
     value_chr    = str_squish(.data[[aca_cols[["value"]]]]),
     unit_original = if (!is.na(aca_unit_col)) str_squish(.data[[aca_unit_col]]) else NA_character_,
-    depth_m      = if (!is.na(aca_depth_col))
-      suppressWarnings(parse_number(.data[[aca_depth_col]], na = c("", "-", "NA")))
-    else NA_real_,
+    depth_m      = if (!is.na(aca_depth_col)) parse_dec(.data[[aca_depth_col]]) else NA_real_,
     date         = as.Date(parse_date_time(.data[[aca_cols[["date"]]]], orders = date_orders,
                                            quiet = TRUE)),
     campaign     = NA_character_
@@ -431,6 +479,8 @@ if (is.na(aca_unit_col))
 cat("\nACA dates: ", format(min(aca$date, na.rm = TRUE)), "to", format(max(aca$date, na.rm = TRUE)),
     "|", sum(is.na(aca$date)), "unreadable\n")
 
+aca <- check_depths(aca, "ACA")
+
 # Deepest sample per station (before the depth filter below)
 aca_depth_info <- aca %>%
   filter(!is.na(depth_m)) %>%
@@ -453,14 +503,14 @@ aca_coords <- NULL
 if (!is.na(aca_lat_col) && !is.na(aca_lon_col)) {
   aca_coords <- aca_raw %>%
     transmute(site_code = .data[[aca_cols[["code"]]]],
-              lat = parse_number(.data[[aca_lat_col]]),
-              lon = parse_number(.data[[aca_lon_col]]))
+              lat = parse_dec(.data[[aca_lat_col]]),
+              lon = parse_dec(.data[[aca_lon_col]]))
 } else if (!is.na(aca_x_col) && !is.na(aca_y_col)) {
   if (requireNamespace("sf", quietly = TRUE)) {
     xy <- aca_raw %>%
       transmute(site_code = .data[[aca_cols[["code"]]]],
-                x = parse_number(.data[[aca_x_col]]),
-                y = parse_number(.data[[aca_y_col]])) %>%
+                x = parse_dec(.data[[aca_x_col]]),
+                y = parse_dec(.data[[aca_y_col]])) %>%
       filter(!is.na(x), !is.na(y)) %>%
       distinct(site_code, .keep_all = TRUE)
     ll <- sf::st_as_sf(xy, coords = c("x", "y"), crs = aca_utm_crs) %>%
@@ -476,6 +526,87 @@ if (!is.null(aca_coords)) {
     group_by(site_code) %>%
     summarise(lat = mean(lat), lon = mean(lon), .groups = "drop") %>%
     mutate(coord_source = "ACA file")
+}
+
+
+# =============================================================================
+# 1b. CHE (Confederación Hidrográfica del Ebro)
+# =============================================================================
+
+che <- NULL; che_coords <- NULL; che_depth_info <- NULL; che_site_meta <- NULL
+if (!is.null(che_file) && file.exists(che_file)) {
+  che_raw <- read_csv(che_file, col_types = cols(.default = col_character()),
+                      locale = locale(encoding = "UTF-8"), na = c("", "NA"))
+  names(che_raw) <- clean_names(names(che_raw))
+  need <- c("codigo.punto", "toponimia.punto", "fecha", "cod.parametro", "parametro",
+            "valor", "unidad", "profundidad", "tipo.muestra")
+  if (length(setdiff(need, names(che_raw))) > 0)
+    stop("CHE columns not found: ", paste(setdiff(need, names(che_raw)), collapse = ", "))
+  che_raw <- filter(che_raw, !is.na(codigo.punto))
+  cat("\nCHE:", nrow(che_raw), "rows,", n_distinct(che_raw$codigo.punto), "sampling points\n")
+  
+  che <- che_raw %>%
+    transmute(
+      source        = "CHE",
+      site_code     = str_squish(codigo.punto),
+      site_name     = str_squish(toponimia.punto),
+      che_code      = str_squish(cod.parametro),
+      var_original  = str_squish(parametro),
+      value_chr     = str_squish(valor),
+      unit_original = na_if(str_squish(unidad), "--"),
+      depth_m       = parse_dec(profundidad),
+      layer         = str_squish(tipo.muestra),
+      date          = as.Date(parse_date_time(fecha, orders = c("dmY", "dmY HMS", "Ymd"), quiet = TRUE)),
+      campaign      = NA_character_,
+      method        = NA_character_
+    ) %>%
+    mutate(
+      var       = coalesce(unname(che_var_map[che_code]), var_original),
+      censored  = str_detect(value_chr, "^[<>]") %in% TRUE,
+      value_raw = suppressWarnings(parse_number(str_replace(value_chr, "(\\d),(\\d)", "\\1.\\2"),
+                                                na = c("", "NR", "--", "-", "NA"))),
+      value_raw = if_else(censored & str_detect(value_chr, "^<") & censored_value == "half",
+                          value_raw / 2, value_raw)
+    )
+  
+  cat("CHE dates:", format(min(che$date, na.rm = TRUE)), "to", format(max(che$date, na.rm = TRUE)),
+      "|", sum(is.na(che$date)), "unreadable\n")
+  cat("CHE values not readable as numbers (e.g. 'NR'):", sum(is.na(che$value_raw)), "\n")
+  
+  che <- check_depths(che, "CHE")
+  
+  # Deepest sample per point (before the depth filter)
+  che_depth_info <- che %>%
+    filter(!is.na(depth_m)) %>%
+    group_by(site_code) %>%
+    summarise(max_depth_sampled_m = max(depth_m), n_depths = n_distinct(depth_m), .groups = "drop")
+  
+  # Surface water only: point samples <= che_max_depth_m, photic-zone integrated samples,
+  # samples without depth; no whole-column or near-bottom samples
+  che <- che %>%
+    filter(!layer %in% che_types_excluded,
+           is.na(depth_m) | depth_m <= che_max_depth_m | str_starts(layer, "Integrada Capa F")) %>%
+    select(-che_code)
+  
+  che_site_meta <- che_raw %>%
+    group_by(site_code = str_squish(codigo.punto)) %>%
+    summarise(municipality = first(municipio), province = first(provincia), .groups = "drop")
+  
+  if (all(c("etrs89.x30", "etrs89.y30") %in% names(che_raw))) {
+    if (requireNamespace("sf", quietly = TRUE)) {
+      xy <- che_raw %>%
+        transmute(site_code = str_squish(codigo.punto),
+                  x = parse_dec(etrs89.x30), y = parse_dec(etrs89.y30)) %>%
+        filter(!is.na(x), !is.na(y)) %>%
+        distinct(site_code, .keep_all = TRUE)
+      ll <- sf::st_as_sf(xy, coords = c("x", "y"), crs = che_utm_crs) %>%
+        sf::st_transform(4326) %>% sf::st_coordinates()
+      che_coords <- tibble(site_code = xy$site_code, lat = ll[, "Y"], lon = ll[, "X"],
+                           coord_source = "CHE file")
+    } else warning("Install 'sf' to use the CHE coordinates: install.packages('sf')")
+  }
+} else {
+  message("CHE file not found or che_file = NULL: CHE data skipped.")
 }
 
 
@@ -516,7 +647,7 @@ m100 <- m100_raw %>%
       str_replace("^uS cm$", "uS/cm"),
     var           = coalesce(unname(m100_var_map[column]), word(column, 1)),
     method        = NA_character_,
-    depth_m       = parse_number(`Fond m`),
+    depth_m       = parse_dec(`Fond m`),
     layer         = CAPA,
     date          = as.Date(NA),
     campaign      = Campanya,
@@ -537,7 +668,7 @@ m100_site_meta <- m100_raw %>%
             m100_grup = first(Grup), m100_grupsimp = first(GrupSIMP),
             m100_grup2 = first(Grup2),
             # deepest sample, all layers (F = near the bottom)
-            max_depth_sampled_m = suppressWarnings(max(parse_number(`Fond m`), na.rm = TRUE)),
+            max_depth_sampled_m = suppressWarnings(max(parse_dec(`Fond m`), na.rm = TRUE)),
             n_depths = n_distinct(`Fond m`), .groups = "drop") %>%
   mutate(max_depth_sampled_m = na_if(max_depth_sampled_m, -Inf))
 
@@ -546,7 +677,7 @@ m100_site_meta <- m100_raw %>%
 # 3. Merge & harmonise units
 # =============================================================================
 
-db_raw <- bind_rows(aca, m100)
+db_raw <- bind_rows(aca, che, m100)
 
 conversions <- db_raw %>%
   count(source, var, unit_original, name = "n_rows") %>%
@@ -645,25 +776,28 @@ if (nrow(dup_names) > 0) {
   cat("\nStation codes with more than one name (first one kept):\n"); print(dup_names)
 }
 
-# Automatic matching across sources: M100 name contained in an ACA name
-aca_keys <- unique(sites$lake_key[sites$source == "ACA"])
-auto_match <- sites %>%
-  filter(source == "M100", !lake_key %in% aca_keys) %>%
-  mutate(match = map_chr(lake_key, function(k) {
-    hit <- aca_keys[str_detect(aca_keys, paste0("\\b", k, "\\b"))]
-    if (length(hit) == 1) hit else NA_character_
-  })) %>%
-  filter(!is.na(match))
-if (nrow(auto_match) > 0) {
-  cat("\nM100 reservoirs matched to ACA by name (check):\n")
-  print(select(auto_match, site_uid, site_name, lake_key, matched_to = match))
-  sites <- sites %>%
-    rows_update(transmute(auto_match, site_uid, lake_key = match), by = "site_uid")
+# Automatic matching across sources, in the order of source_priority: a site whose name is
+# contained in the name of a lake of a higher-priority source (e.g. M100 "Boadella" ->
+# ACA "Darnius-Boadella") gets that lake's key
+for (j in seq_along(source_priority)[-1]) {
+  target_keys <- unique(sites$lake_key[sites$source %in% source_priority[seq_len(j - 1)]])
+  auto_match <- sites %>%
+    filter(source == source_priority[j], !lake_key %in% target_keys) %>%
+    mutate(match = map_chr(lake_key, function(k) {
+      hit <- target_keys[str_detect(target_keys, paste0("\\b", k, "\\b"))]
+      if (length(hit) == 1) hit else NA_character_
+    })) %>%
+    filter(!is.na(match))
+  if (nrow(auto_match) > 0) {
+    cat("\n", source_priority[j], " sites matched by name to another source (check):\n", sep = "")
+    print(select(auto_match, site_uid, site_name, lake_key, matched_to = match))
+    sites <- rows_update(sites, transmute(auto_match, site_uid, lake_key = match), by = "site_uid")
+  }
 }
 if (nrow(lake_crosswalk) > 0)
   sites <- rows_update(sites, lake_crosswalk, by = "site_uid", unmatched = "ignore")
 
-cat("\nLakes present in both sources:\n")
+cat("\nLakes present in several sources:\n")
 print(sites %>% group_by(lake_key) %>% filter(n_distinct(source) > 1) %>%
         arrange(lake_key) %>% select(lake_key, source, site_uid, site_name), n = Inf)
 
@@ -678,8 +812,13 @@ coords_cache <- if (file.exists(coords_cache_file)) {
 } else tibble(site_uid = character(), lat = double(), lon = double(), coord_source = character(),
               osm_class = character(), osm_type = character(), osm_name = character())
 
-coords_aca <- if (is.null(aca_coords)) NULL else
-  aca_coords %>% transmute(site_uid = paste("ACA", site_code, sep = "_"), lat, lon, coord_source)
+coords_aca <- bind_rows(
+  if (is.null(aca_coords)) NULL else
+    transmute(aca_coords, site_uid = paste("ACA", site_code, sep = "_"), lat, lon, coord_source),
+  if (is.null(che_coords)) NULL else
+    transmute(che_coords, site_uid = paste("CHE", site_code, sep = "_"), lat, lon, coord_source))
+if (nrow(coords_aca) == 0) coords_aca <- tibble(site_uid = character(), lat = double(),
+                                                lon = double(), coord_source = character())
 
 coords_known <- bind_rows(coords_manual, coords_aca,
                           filter(coords_cache, !is.na(lat))) %>%
@@ -692,7 +831,7 @@ to_geocode <- sites %>% filter(!site_uid %in% coords_known$site_uid,
 
 cat("\nCoordinates reused: ",
     sum(sites$site_uid %in% coords_manual$site_uid), " from coordinates_manual.csv, ",
-    sum(sites$site_uid %in% setdiff(coords_aca$site_uid, coords_manual$site_uid)), " from the ACA file, ",
+    sum(sites$site_uid %in% setdiff(coords_aca$site_uid, coords_manual$site_uid)), " from the ACA/CHE files, ",
     sum(sites$site_uid %in% setdiff(filter(coords_cache, !is.na(lat))$site_uid,
                                     c(coords_manual$site_uid, coords_aca$site_uid))), " from the cache",
     " | to look up now: ", nrow(to_geocode), "\n", sep = "")
@@ -758,25 +897,46 @@ sites <- sites %>%
   ) %>%
   left_join(mutate(m100_site_meta, site_uid = paste("M100", site_code, sep = "_")) %>%
               select(-site_code, -max_depth_sampled_m, -n_depths), by = "site_uid") %>%
+  left_join(if (is.null(che_site_meta)) tibble(site_uid = character()) else
+    transmute(che_site_meta, site_uid = paste("CHE", site_code, sep = "_"),
+              municipality, province), by = "site_uid") %>%
   left_join(bind_rows(
     mutate(aca_depth_info, site_uid = paste("ACA", site_code, sep = "_")),
+    if (is.null(che_depth_info)) NULL else
+      mutate(che_depth_info, site_uid = paste("CHE", site_code, sep = "_")),
     transmute(m100_site_meta, site_uid = paste("M100", site_code, sep = "_"),
               max_depth_sampled_m, n_depths)) %>%
       select(site_uid, max_depth_sampled_m, n_depths),
     by = "site_uid")
 
-# Different lakes with (almost) the same coordinates: usually a wrong geocode or copy-paste.
-# Pairs where both points come from the ACA file are not checked (stations are surveyed).
-pts <- sites %>% filter(!is.na(lat)) %>% select(site_uid, site_name, lake_key, lat, lon, coord_source)
-close_pairs <- cross_join(pts, pts, suffix = c("_1", "_2")) %>%
-  filter(site_uid_1 < site_uid_2, lake_key_1 != lake_key_2,
-         !(coord_source_1 == "ACA file" & coord_source_2 == "ACA file")) %>%
-  mutate(dist_m = round(1000 * haversine_km(lat_1, lon_1, lat_2, lon_2))) %>%
-  filter(dist_m < close_coords_m) %>%
+# Different lakes with (almost) the same coordinates:
+#  - same source: usually a wrong geocode or copy-paste -> flagged
+#    (not checked when both points come from the ACA / CHE files: stations are surveyed)
+#  - different sources: probably the same lake under two names -> listed as crosswalk candidates
+pts <- sites %>% filter(!is.na(lat)) %>%
+  select(source, site_uid, site_name, lake_key, lat, lon, coord_source)
+pairs_all <- cross_join(pts, pts, suffix = c("_1", "_2")) %>%
+  filter(site_uid_1 < site_uid_2, lake_key_1 != lake_key_2) %>%
+  mutate(dist_m = round(1000 * haversine_km(lat_1, lon_1, lat_2, lon_2)))
+
+same_lake <- pairs_all %>%
+  filter(source_1 != source_2, dist_m < same_lake_m) %>%
+  select(site_uid_1, site_name_1, lake_key_1, site_uid_2, site_name_2, lake_key_2, dist_m) %>%
+  arrange(dist_m)
+write_excel_csv(same_lake, file.path(out_dir, "cross_source_close_sites.csv"), na = "")
+if (nrow(same_lake) > 0) {
+  cat("\nSites of different sources less than", same_lake_m, "m apart but with different names",
+      "(same lake? if so, add them to lake_crosswalk):\n")
+  print(select(same_lake, site_uid_1, site_name_1, site_uid_2, site_name_2, dist_m), n = 50)
+}
+
+close_pairs <- pairs_all %>%
+  filter(source_1 == source_2, dist_m < close_coords_m,
+         !(str_ends(coord_source_1, " file") & str_ends(coord_source_2, " file"))) %>%
   select(site_uid_1, site_name_1, site_uid_2, site_name_2, dist_m, lat_1, lon_1, lat_2, lon_2)
 write_excel_csv(close_pairs, file.path(out_dir, "coordinates_close_pairs.csv"), na = "")
 if (nrow(close_pairs) > 0) {
-  warning(nrow(close_pairs), " pairs of different lakes are less than ", close_coords_m,
+  warning(nrow(close_pairs), " pairs of different lakes (same source) are less than ", close_coords_m,
           " m apart — probably wrong coordinates (see coordinates_close_pairs.csv)")
   cat("\nDifferent lakes with (almost) the same coordinates:\n")
   print(select(close_pairs, site_uid_1, site_name_1, site_uid_2, site_name_2, dist_m), n = Inf)
@@ -895,7 +1055,7 @@ lake_info <- sites %>%
   mutate(src_rank = match(source, source_priority)) %>%
   arrange(src_rank) %>%
   group_by(lake_key) %>%
-  summarise(lake_name = first(site_name),
+  summarise(lake_name = first(str_remove(site_name, "\\s*\\((orilla|Orilla|FQ)\\)\\s*$")),
             sources   = paste(sort(unique(source)), collapse = "+"),
             site_uids = paste(site_uid, collapse = ";"),
             .groups = "drop")
@@ -1006,6 +1166,11 @@ if (nrow(small) > 0) {
   print(small %>% left_join(select(lake_info, lake_key, lake_name), by = "lake_key") %>%
           select(lake_name, area_ha, area_source, osm_name), n = Inf)
 }
+cat("\nDeepest lakes (check these are realistic):\n")
+print(lake_attributes %>% left_join(select(lake_info, lake_key, lake_name), by = "lake_key") %>%
+        arrange(desc(max_depth_m)) %>% select(lake_name, max_depth_m, depth_source, n_depths) %>%
+        head(10))
+
 cat("\nDepth and area availability (lakes):\n")
 print(lake_attributes %>% summarise(
   n_lakes = n(), depth_any = sum(!is.na(max_depth_m)), depth_profiled_or_manual = sum(depth_known),
@@ -1048,18 +1213,26 @@ lake_summary_out <- lake_summary %>%
 write_excel_csv(lake_summary_out, file.path(out_dir, "lake_summary_priority.csv"), na = "")
 write_rds(lake_summary, file.path(out_dir, "lake_summary_priority.rds"))
 
-# 6c. Lakes in both sources: are the units consistent? (ratio ACA / M100 far from ~1 = suspicious)
+# 6c. Lakes in several sources: are the units consistent?
+# (a ratio of medians far from ~1, e.g. ~50 or ~1000, means a unit problem)
 cross_check <- lake_stats %>%
   group_by(lake_key) %>% filter(n_distinct(source) > 1) %>% ungroup() %>%
   select(lake_key, source, var, median) %>%
-  pivot_wider(names_from = source, values_from = median) %>%
-  { if (all(c("ACA", "M100") %in% names(.))) mutate(., ratio_ACA_M100 = ACA / M100) else . }
+  pivot_wider(names_from = source, values_from = median)
+src_pairs <- combn(intersect(source_priority, names(cross_check)), 2, simplify = FALSE)
+if (length(intersect(source_priority, names(cross_check))) < 2) src_pairs <- list()
+for (p in src_pairs)
+  cross_check[[paste0("ratio_", p[1], "_", p[2])]] <- cross_check[[p[1]]] / cross_check[[p[2]]]
 write_excel_csv(cross_check, file.path(out_dir, "cross_source_check.csv"), na = "")
-if (nrow(cross_check) > 0 && "ratio_ACA_M100" %in% names(cross_check)) {
-  cat("\nMedian ratio ACA / M100 per variable, lakes in both sources",
-      "(1970s vs today, so not exactly 1 — but a factor ~50 or ~1000 means a unit problem):\n")
-  print(cross_check %>% group_by(var) %>%
-          summarise(n_lakes = n(), median_ratio = median(ratio_ACA_M100, na.rm = TRUE)))
+if (length(src_pairs) > 0) {
+  cat("\nMedian ratio between sources per variable, lakes present in both",
+      "(M100 is 1970s, so not exactly 1 — but ~50 or ~1000 means a unit problem):\n")
+  print(cross_check %>%
+          pivot_longer(starts_with("ratio_"), names_to = "sources", values_to = "ratio") %>%
+          filter(!is.na(ratio)) %>%
+          group_by(sources, var) %>%
+          summarise(n_lakes = n(), median_ratio = signif(median(ratio), 3), .groups = "drop"),
+        n = Inf)
 }
 
 cat("\nDone. Files written to", out_dir, "\n")
